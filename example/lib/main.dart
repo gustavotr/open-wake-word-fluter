@@ -36,7 +36,9 @@ class _MyAppState extends State<MyApp> {
     final success = await OpenWakeWord.init(
       melModelAssetPath: 'assets/models/melspectrogram.onnx',
       embModelAssetPath: 'assets/models/embedding_model.onnx',
-      wwModelAssetPath: 'assets/models/hey_jarvis_v0.1.onnx',
+      wwModelAssetPaths: [
+        'assets/models/hey_jarvis_v0.1.onnx',
+      ],
     );
 
     setState(() {

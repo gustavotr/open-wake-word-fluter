@@ -8,6 +8,8 @@
 #include <thread>
 #include <vector>
 #include <atomic>
+#include <sstream>
+#include <algorithm>
 
 #include <onnxruntime_cxx_api.h>
 
@@ -21,24 +23,29 @@ const size_t embWindowSize = 76; // 775 ms
 const size_t embStepSize = 8;    // 80 ms
 const size_t embFeatures = 96;
 const size_t wwFeatures = 16;
-const size_t frameSize = 1280;
 
 struct Settings {
   string melModelPath;
   string embModelPath;
-  string wwModelPath;
+  vector<string> wwModelPaths;
+
+  size_t stepFrames = 4;
+  size_t frameSize = 4 * chunkSamples; // 5120
 
   float threshold = 0.5f;
+  int triggerLevel = 4;
+  int refractory = 20;
+
   Ort::SessionOptions options;
 };
 
 struct EngineState {
   Ort::Env env;
 
-  mutex mutFeatures;
-  condition_variable cvFeatures;
-  bool featuresExhausted = false;
-  bool featuresReady = false;
+  vector<mutex> mutFeatures;
+  vector<condition_variable> cvFeatures;
+  vector<bool> featuresExhausted;
+  vector<bool> featuresReady;
 
   bool samplesExhausted = false;
   bool melsExhausted = false;
@@ -53,9 +60,15 @@ struct EngineState {
   std::atomic<float> latestProbability{0.0f};
   std::atomic<bool> isActivated{false};
 
-  EngineState() {
+  EngineState(size_t numWakeWords) :
+        mutFeatures(numWakeWords),
+        cvFeatures(numWakeWords),
+        featuresExhausted(numWakeWords),
+        featuresReady(numWakeWords) {
     env = Ort::Env(OrtLoggingLevel::ORT_LOGGING_LEVEL_WARNING, instanceName.c_str());
     env.DisableTelemetryEvents();
+    fill(featuresExhausted.begin(), featuresExhausted.end(), false);
+    fill(featuresReady.begin(), featuresReady.end(), false);
   }
 };
 
@@ -64,11 +77,15 @@ static EngineState* g_state = nullptr;
 
 static vector<float> g_floatSamples;
 static vector<float> g_mels;
-static vector<float> g_features;
+static vector<vector<float>> g_features;
 
 static thread* g_melThread = nullptr;
 static thread* g_featuresThread = nullptr;
-static thread* g_wwThread = nullptr;
+static vector<thread*> g_wwThreads;
+
+std::wstring to_wstring(const std::string& str) {
+    return std::wstring(str.begin(), str.end());
+}
 
 // Thread 1: Audio -> Mels
 void audioToMels() {
@@ -78,13 +95,13 @@ void audioToMels() {
 
   auto melSession = Ort::Session(g_state->env,
 #ifdef _WIN32
-    std::wstring(g_settings->melModelPath.begin(), g_settings->melModelPath.end()).c_str(),
+    to_wstring(g_settings->melModelPath).c_str(),
 #else
     g_settings->melModelPath.c_str(),
 #endif
   g_settings->options);
 
-  vector<int64_t> samplesShape{1, (int64_t)frameSize};
+  vector<int64_t> samplesShape{1, (int64_t)g_settings->frameSize};
 
   auto melInputName = melSession.GetInputNameAllocated(0, allocator);
   vector<const char *> melInputNames{melInputName.get()};
@@ -117,9 +134,9 @@ void audioToMels() {
       }
     }
 
-    while (todoSamples.size() >= frameSize) {
+    while (todoSamples.size() >= g_settings->frameSize) {
       Ort::Value melInputTensor = Ort::Value::CreateTensor<float>(
-          memoryInfo, todoSamples.data(), frameSize,
+          memoryInfo, todoSamples.data(), g_settings->frameSize,
           samplesShape.data(), samplesShape.size());
 
       auto melOutputTensors =
@@ -144,7 +161,7 @@ void audioToMels() {
         g_state->cvMels.notify_one();
       }
 
-      todoSamples.erase(todoSamples.begin(), todoSamples.begin() + frameSize);
+      todoSamples.erase(todoSamples.begin(), todoSamples.begin() + g_settings->frameSize);
     }
   }
 }
@@ -157,7 +174,7 @@ void melsToFeatures() {
 
   auto embSession = Ort::Session(g_state->env, 
 #ifdef _WIN32
-    std::wstring(g_settings->embModelPath.begin(), g_settings->embModelPath.end()).c_str(),
+    to_wstring(g_settings->embModelPath).c_str(),
 #else
     g_settings->embModelPath.c_str(), 
 #endif
@@ -215,12 +232,12 @@ void melsToFeatures() {
       const float *embOutData = embOut.GetTensorData<float>();
       size_t embOutCount = accumulate(embOutShape.begin(), embOutShape.end(), 1, multiplies<size_t>());
 
-      {
-        unique_lock<mutex> lockFeatures{g_state->mutFeatures};
-        g_features.reserve(g_features.size() + embOutCount);
-        copy(embOutData, embOutData + embOutCount, back_inserter(g_features));
-        g_state->featuresReady = true;
-        g_state->cvFeatures.notify_one();
+      for (size_t i = 0; i < g_features.size(); i++) {
+        unique_lock<mutex> lockFeatures{g_state->mutFeatures[i]};
+        g_features[i].reserve(g_features[i].size() + embOutCount);
+        copy(embOutData, embOutData + embOutCount, back_inserter(g_features[i]));
+        g_state->featuresReady[i] = true;
+        g_state->cvFeatures[i].notify_one();
       }
 
       todoMels.erase(todoMels.begin(), todoMels.begin() + (embStepSize * numMels));
@@ -230,16 +247,17 @@ void melsToFeatures() {
 }
 
 // Thread 3: Features -> Output Probability
-void featuresToOutput() {
+void featuresToOutput(size_t wwIdx) {
   Ort::AllocatorWithDefaultOptions allocator;
   auto memoryInfo = Ort::MemoryInfo::CreateCpu(
       OrtAllocatorType::OrtArenaAllocator, OrtMemType::OrtMemTypeDefault);
 
+  string wwModelPath = g_settings->wwModelPaths[wwIdx];
   auto wwSession = Ort::Session(g_state->env, 
 #ifdef _WIN32
-    std::wstring(g_settings->wwModelPath.begin(), g_settings->wwModelPath.end()).c_str(),
+    to_wstring(wwModelPath).c_str(),
 #else
-    g_settings->wwModelPath.c_str(), 
+    wwModelPath.c_str(), 
 #endif
   g_settings->options);
 
@@ -253,6 +271,7 @@ void featuresToOutput() {
 
   vector<float> todoFeatures;
   size_t numBufferedFeatures = 0;
+  int activation = 0;
 
   {
     unique_lock<mutex> lockReady(g_state->mutReady);
@@ -264,16 +283,16 @@ void featuresToOutput() {
 
   while (true) {
     {
-      unique_lock<mutex> lockFeatures{g_state->mutFeatures};
-      g_state->cvFeatures.wait(lockFeatures, [] { return g_state->featuresReady; });
-      if (g_state->featuresExhausted && g_features.empty()) {
+      unique_lock<mutex> lockFeatures{g_state->mutFeatures[wwIdx]};
+      g_state->cvFeatures[wwIdx].wait(lockFeatures, [&, wwIdx] { return g_state->featuresReady[wwIdx]; });
+      if (g_state->featuresExhausted[wwIdx] && g_features[wwIdx].empty()) {
         break;
       }
-      copy(g_features.begin(), g_features.end(), back_inserter(todoFeatures));
-      g_features.clear();
+      copy(g_features[wwIdx].begin(), g_features[wwIdx].end(), back_inserter(todoFeatures));
+      g_features[wwIdx].clear();
 
-      if (!g_state->featuresExhausted) {
-        g_state->featuresReady = false;
+      if (!g_state->featuresExhausted[wwIdx]) {
+        g_state->featuresReady[wwIdx] = false;
       }
     }
 
@@ -295,8 +314,26 @@ void featuresToOutput() {
 
       for (size_t i = 0; i < wwOutCount; i++) {
         float probability = wwOutData[i];
-        g_state->latestProbability.store(probability);
-        g_state->isActivated.store(probability > g_settings->threshold);
+        
+        // We will just update global probability mapping to max to keep FFI simple for now
+        float currentMax = g_state->latestProbability.load();
+        if (probability > currentMax) {
+           g_state->latestProbability.store(probability);
+        }
+
+        if (probability > g_settings->threshold) {
+          activation++;
+          if (activation >= g_settings->triggerLevel) {
+            g_state->isActivated.store(true);
+            activation = -g_settings->refractory;
+          }
+        } else {
+          if (activation > 0) {
+            activation = max(0, activation - 1);
+          } else {
+            activation = min(0, activation + 1);
+          }
+        }
       }
 
       todoFeatures.erase(todoFeatures.begin(), todoFeatures.begin() + (1 * embFeatures));
@@ -307,30 +344,49 @@ void featuresToOutput() {
 
 extern "C" {
 
-int oww_init(const char* mel_model_path, const char* emb_model_path, const char* ww_model_path) {
+int oww_init(const char* mel_model_path, const char* emb_model_path, const char* ww_model_paths_csv) {
   if (g_settings) oww_destroy();
 
   try {
     g_settings = new Settings();
     g_settings->melModelPath = mel_model_path;
     g_settings->embModelPath = emb_model_path;
-    g_settings->wwModelPath = ww_model_path;
+    
+    // Parse comma separated wake word models
+    string paths(ww_model_paths_csv);
+    stringstream ss(paths);
+    string item;
+    while (getline(ss, item, ',')) {
+      if (!item.empty()) {
+        g_settings->wwModelPaths.push_back(item);
+      }
+    }
+
+    if (g_settings->wwModelPaths.empty()) {
+      return -1;
+    }
 
     g_settings->options.SetIntraOpNumThreads(1);
     g_settings->options.SetInterOpNumThreads(1);
     g_settings->options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
 
-    g_state = new EngineState();
+    size_t numModels = g_settings->wwModelPaths.size();
+    g_state = new EngineState(numModels);
+    g_features.resize(numModels);
 
     g_melThread = new thread(audioToMels);
     g_featuresThread = new thread(melsToFeatures);
-    g_wwThread = new thread(featuresToOutput);
+    
+    for (size_t i = 0; i < numModels; i++) {
+      g_wwThreads.push_back(new thread(featuresToOutput, i));
+    }
 
-    // Block until all 3 threads have loaded models
+    // Block until all threads have loaded models
+    size_t expectedReady = 2 + numModels;
     {
       unique_lock<mutex> lockReady(g_state->mutReady);
-      g_state->cvReady.wait(lockReady, [] {
-        return g_state->numReady == 3;
+      g_state->cvReady.wait(lockReady, [&] {
+        return g_state->numReady == expectedReady;
       });
     }
     return 0; // Success
@@ -355,12 +411,12 @@ void oww_process_audio(const int16_t* audio_data, int length) {
 
 float oww_get_probability() {
   if (!g_state) return 0.0f;
-  return g_state->latestProbability.load();
+  return g_state->latestProbability.exchange(0.0f); // Reset so it doesn't get stuck at max
 }
 
 bool oww_is_activated() {
   if (!g_state) return false;
-  return g_state->isActivated.load();
+  return g_state->isActivated.exchange(false); // Clear activation after reading
 }
 
 void oww_destroy() {
@@ -382,13 +438,19 @@ void oww_destroy() {
   }
   if (g_featuresThread) { g_featuresThread->join(); delete g_featuresThread; g_featuresThread = nullptr; }
 
-  {
-    unique_lock<mutex> lockFeatures{g_state->mutFeatures};
-    g_state->featuresExhausted = true;
-    g_state->featuresReady = true;
-    g_state->cvFeatures.notify_one();
+  for (size_t i = 0; i < g_wwThreads.size(); i++) {
+    {
+      unique_lock<mutex> lockFeatures{g_state->mutFeatures[i]};
+      g_state->featuresExhausted[i] = true;
+      g_state->featuresReady[i] = true;
+      g_state->cvFeatures[i].notify_one();
+    }
+    if (g_wwThreads[i]) { 
+        g_wwThreads[i]->join(); 
+        delete g_wwThreads[i]; 
+    }
   }
-  if (g_wwThread) { g_wwThread->join(); delete g_wwThread; g_wwThread = nullptr; }
+  g_wwThreads.clear();
 
   delete g_state;
   g_state = nullptr;

@@ -51,7 +51,7 @@ import 'package:open_wake_word/open_wake_word.dart';
 bool success = await OpenWakeWord.init(
   melModelAssetPath: 'assets/models/melspectrogram.onnx',
   embModelAssetPath: 'assets/models/embedding_model.onnx',
-  wwModelAssetPath: 'assets/models/hey_jarvis.onnx',
+  wwModelAssetPaths: ['assets/models/hey_jarvis.onnx'],
 );
 ```
 

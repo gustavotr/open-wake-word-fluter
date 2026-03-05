@@ -36,16 +36,22 @@ class OpenWakeWord {
   static Future<bool> init({
     required String melModelAssetPath,
     required String embModelAssetPath,
-    required String wwModelAssetPath,
+    required List<String> wwModelAssetPaths,
   }) async {
     try {
       final melPath = await _extractAsset(melModelAssetPath);
       final embPath = await _extractAsset(embModelAssetPath);
-      final wwPath = await _extractAsset(wwModelAssetPath);
+      
+      final List<String> extractedWwPaths = [];
+      for (final wwAssetPath in wwModelAssetPaths) {
+        extractedWwPaths.add(await _extractAsset(wwAssetPath));
+      }
+      
+      final wwPathsCsv = extractedWwPaths.join(',');
 
       final melPtr = melPath.toNativeUtf8();
       final embPtr = embPath.toNativeUtf8();
-      final wwPtr = wwPath.toNativeUtf8();
+      final wwPtr = wwPathsCsv.toNativeUtf8();
 
       final result = _bindings.oww_init(
         melPtr.cast<Char>(),
