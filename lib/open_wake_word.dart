@@ -1,3 +1,6 @@
+/// The open_wake_word library for Flutter.
+library open_wake_word;
+
 import 'dart:ffi';
 import 'dart:io';
 import 'dart:typed_data';
@@ -5,7 +8,7 @@ import 'dart:typed_data';
 import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 
-import 'open_wake_word_bindings_generated.dart';
+import 'src/open_wake_word_bindings_generated.dart';
 import 'package:ffi/ffi.dart';
 
 const String _libName = 'open_wake_word';
@@ -30,7 +33,10 @@ final DynamicLibrary _dylib = () {
 
 final OpenWakeWordBindings _bindings = OpenWakeWordBindings(_dylib);
 
+/// Main class to interact with the underlying C++ openWakeWord engine.
 class OpenWakeWord {
+  OpenWakeWord._(); // Private constructor to prevent instantiation
+
   /// Initialize the OpenWakeWord engine with the given models.
   /// Ensure the models correctly exist in your flutter asset bundle.
   static Future<bool> init({

@@ -1,3 +1,13 @@
+## 0.2.1
+
+* Updates and improvements to pub.dev scoring.
+* Move generated bindings to `src` directory to hide them from the public API.
+* Add documentation comments to public API elements.
+
+## 0.2.0
+
+* Bumped version to include initial features and platforms.
+
 ## 0.1.2
 
 * Performance improvements for openWakeWord C++ runtime execution.
